@@ -1,0 +1,204 @@
+name: 🧪 Langfuse Experiment Runner
+
+on:
+  # Schedule - runs every day at 9 AM UTC
+  schedule:
+    - cron: '0 9 * * *'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      experiment_name:
+        description: 'Experiment name'
+        required: false
+        default: ''
+        type: string
+      success_threshold:
+        description: 'Success threshold (0.0-1.0)'
+        required: true
+        default: '0.8'
+        type: string
+      log_level:
+        description: 'Log level'
+        required: true
+        default: 'info'
+        type: choice
+        options:
+        - info
+        - debug
+        - warning
+  
+  # Trigger on push to main branch
+  push:
+    branches: [ main ]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/**'
+      - 'model/**'
+
+jobs:
+  run-langfuse-experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    env:
+      PYTHON_VERSION: '3.11'
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: 🕐 Generate Timestamp
+      id: timestamp
+      run: |
+        TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+        echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+        echo "Generated timestamp: $TIMESTAMP"
+      
+    - name: 🐍 Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔍 Verify Environment
+      run: |
+        python --version
+        pip list
+        echo "Checking Langfuse installation..."
+        python -c "import langfuse; print(f'Langfuse version: {langfuse.__version__}')"
+        
+    - name: 🧪 Run Langfuse Experiment
+      env:
+        LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+        LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST || 'https://cloud.langfuse.com' }}
+        OPEN_AI_KEY: ${{ secrets.OPEN_AI_KEY }}
+        EXPERIMENT_NAME: ${{ github.event.inputs.experiment_name || format('langfuse_experiment_{0}', steps.timestamp.outputs.timestamp) }}
+        SUCCESS_THRESHOLD: ${{ github.event.inputs.success_threshold || '0.8' }}
+        LOG_LEVEL: ${{ github.event.inputs.log_level || 'info' }}
+        PYTHONPATH: ${{ github.workspace }}
+      run: |
+        echo "🧪 Starting Langfuse experiment runner"
+        echo "📊 Experiment name: $EXPERIMENT_NAME"
+        echo "🎯 Success threshold: $SUCCESS_THRESHOLD"
+        echo "📝 Log level: $LOG_LEVEL"
+        echo "🏠 Langfuse host: $LANGFUSE_HOST"
+        python scripts/api_runner.py
+        
+    - name: 📊 Display Results Summary
+      if: always()
+      run: |
+        echo "📈 Experiment Results Summary:"
+        if ls experiment_results_*.json 1> /dev/null 2>&1; then
+          for file in experiment_results_*.json; do
+            echo "📄 Results file: $file"
+            echo "📊 Contents:"
+            cat "$file" | jq '.'
+          done
+        else
+          echo "⚠️ No result files found"
+        fi
+        
+    - name: 📄 Upload Experiment Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: langfuse-experiment-results-${{ github.run_number }}
+        path: |
+          experiment_results_*.json
+          *.log
+        retention-days: 30
+        
+    - name: 🎯 Check Success Threshold
+      if: always()
+      run: |
+        THRESHOLD="${{ github.event.inputs.success_threshold || '0.8' }}"
+        echo "🎯 Checking if experiment met success threshold of $THRESHOLD"
+        
+        if ls experiment_results_*.json 1> /dev/null 2>&1; then
+          LATEST_RESULT=$(ls -t experiment_results_*.json | head -1)
+          SUCCESS_RATE=$(cat "$LATEST_RESULT" | jq -r '.success_rate // 0')
+          
+          echo "📊 Success rate: $SUCCESS_RATE"
+          echo "🎯 Threshold: $THRESHOLD"
+          
+          if (( $(echo "$SUCCESS_RATE >= $THRESHOLD" | bc -l) )); then
+            echo "✅ Success rate meets threshold!"
+            echo "THRESHOLD_MET=true" >> $GITHUB_ENV
+          else
+            echo "❌ Success rate below threshold!"
+            echo "THRESHOLD_MET=false" >> $GITHUB_ENV
+          fi
+        else
+          echo "⚠️ No results file found, marking as failed"
+          echo "THRESHOLD_MET=false" >> $GITHUB_ENV
+        fi
+        
+    - name: 📧 Notify on Failure or Low Success Rate
+      if: failure() || env.THRESHOLD_MET == 'false'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Try to read the latest experiment results
+          let resultsContent = '';
+          try {
+            const files = fs.readdirSync('.').filter(f => f.startsWith('experiment_results_'));
+            if (files.length > 0) {
+              const latestFile = files.sort().reverse()[0];
+              const results = JSON.parse(fs.readFileSync(latestFile, 'utf8'));
+              resultsContent = `
+              **📊 Experiment Results:**
+              - Success Rate: ${(results.success_rate * 100).toFixed(2)}%
+              - Threshold: ${process.env.SUCCESS_THRESHOLD || '80'}%
+              - Timestamp: ${results.timestamp}
+              `;
+            }
+          } catch (e) {
+            resultsContent = '⚠️ Could not read experiment results';
+          }
+          
+          const experimentName = process.env.EXPERIMENT_NAME || 'langfuse_experiment_unknown';
+          const isFailure = context.job_status === 'failure';
+          const title = isFailure ? 
+            `🚨 Langfuse Experiment Failed - ${new Date().toISOString().split('T')[0]}` :
+            `⚠️ Langfuse Experiment Below Threshold - ${experimentName}`;
+          
+          const issue = await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: `
+            ## ${isFailure ? '❌ Experiment Failed' : '⚠️ Success Rate Below Threshold'}
+            
+            **🧪 Experiment:** ${experimentName}
+            **🏃 Workflow:** ${context.workflow}
+            **🔧 Job:** ${context.job}
+            **🆔 Run ID:** ${context.runId}
+            **🔄 Triggered by:** ${context.eventName}
+            
+            ${resultsContent}
+            
+            **🔗 Details:**
+            Check the [workflow run](${context.payload.repository.html_url}/actions/runs/${context.runId}) for complete logs and artifacts.
+            
+            **⏰ Time:** ${new Date().toISOString()}
+            `,
+            labels: ['langfuse', 'experiment', 'automation', isFailure ? 'failure' : 'low-performance']
+          });
+          console.log('Created issue:', issue.data.number);
+          
+    - name: 🎉 Success Notification
+      if: success() && env.THRESHOLD_MET == 'true'
+      run: |
+        echo "🎉 Experiment completed successfully!"
+        echo "✅ Success rate meets or exceeds threshold"
+        echo "📊 Check the artifacts for detailed results"
