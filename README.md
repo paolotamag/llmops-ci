@@ -9,7 +9,7 @@ In this repository:
 - A notebook to set up Langfuse datasets.
 - A script to run a test using a Langfuse experiment (on the created dataset).
 - A github workflow (.yml) to set up GitHub Actions.
-- A guide (below) on how to piece everything together.
+- A guide (below) on how to proceed step by step.
 
 ## GitHub Actions Setup Guide for Langfuse Experiments
 
